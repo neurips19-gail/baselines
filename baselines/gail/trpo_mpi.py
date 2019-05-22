@@ -19,6 +19,11 @@ from baselines.common.mpi_adam import MpiAdam
 from baselines.common.cg import cg
 from baselines.gail.statistics import stats
 
+NOISE_DIM = 10  # dimensionality of uniform noise
+T = 10  # contrained optimization time threshold
+REGULARIZE = True   # whether to regularize via data augmentation
+REG_STD = 1.0   # stddev of data augmentation
+
 
 def traj_segment_generator(pi, env, reward_giver, horizon, stochastic):
 
@@ -69,7 +74,8 @@ def traj_segment_generator(pi, env, reward_giver, horizon, stochastic):
         acs[i] = ac
         prevacs[i] = prevac
 
-        rew = reward_giver.get_reward(ob, ac)
+        noisy_ob = np.append(ob, np.random.uniform(0., 1., NOISE_DIM))
+        rew = reward_giver.get_reward(noisy_ob, ac)
         ob, true_rew, new, _ = env.step(ac)
         rews[i] = rew
         true_rews[i] = true_rew
@@ -316,13 +322,71 @@ def learn(env, policy_func, reward_giver, expert_dataset, rank,
         ob_expert, ac_expert = expert_dataset.get_next_batch(len(ob))
         batch_size = len(ob) // d_step
         d_losses = []  # list of tuples, each of which gives the loss for a minibatch
-        for ob_batch, ac_batch in dataset.iterbatches((ob, ac),
-                                                      include_final_partial_batch=False,
-                                                      batch_size=batch_size):
+        
+        # Get agent data.
+        for which_steps_batch, (ob_batch, ac_batch) in dataset.iterbatches(
+            (ob, ac),
+            include_final_partial_batch=False,
+            batch_size=batch_size,
+            yield_t=True):
+            
+            # Get expert data.
             ob_expert, ac_expert = expert_dataset.get_next_batch(len(ob_batch))
+
+            # Strip step counter from expert observation.
+            which_steps_expert = ob_expert[:, -1]
+            ob_expert = ob_expert[:, :-1]
+
+            # Extend agent observation with uniform noise.
+            ob_batch = np.stack([
+              np.append(o, np.random.uniform(0., 1., NOISE_DIM)) for o in ob_batch
+            ], axis=0)
+
+            # Regularize by addition Gaussian noise.
+            if REGULARIZE:
+                ob_expert += np.random.uniform(0., REG_STD, np.shape(ob_expert))
+                ob_batch += np.random.uniform(0., REG_STD, np.shape(ob_expert))
+
+            # Calculate *agent* acc and grad w.r.t. loss for agent t < T.
+            steps_ltt_batch = np.squeeze(np.where(which_steps_batch < T))
+            ob_batch_ltt = np.take(ob_batch, indices=steps_ltt_batch, axis=0)
+            ac_batch_ltt = np.take(ac_batch, indices=steps_ltt_batch, axis=0)
+
+            # Expert data for the same timesteps.
+            paired_ob_expert = np.take(ob_expert, indices=steps_ltt_batch, axis=0)
+            paired_ac_expert = np.take(ac_expert, indices=steps_ltt_batch, axis=0)
+
+            batch_acc_ltt, batch_g_ltt = reward_giver.batchaccandgrad(
+              ob_batch_ltt, ac_batch_ltt, paired_ob_expert, paired_ac_expert)
+
+
+            # Calculate *expert* acc and grad w.r.t. loss for expert t < T.
+            steps_ltt_expert = np.squeeze(np.where(which_steps_expert < T))
+            ob_expert_ltt = np.take(ob_expert, indices=steps_ltt_expert, axis=0)
+            ac_expert_ltt = np.take(ac_expert, indices=steps_ltt_expert, axis=0)
+
+            # Batch data for the same timesteps.
+            paired_ob_batch = np.take(ob_batch, indices=steps_ltt_expert, axis=0)
+            paired_ac_batch = np.take(ac_batch, indices=steps_ltt_expert, axis=0)
+
+            expert_acc_ltt, expert_g_ltt = reward_giver.expertaccandgrad(
+              paired_ob_batch, paired_ac_batch, ob_expert_ltt, ac_expert_ltt)
+            
             # update running mean/std for reward_giver
             if hasattr(reward_giver, "obs_rms"): reward_giver.obs_rms.update(np.concatenate((ob_batch, ob_expert), 0))
             *newlosses, g = reward_giver.lossandgrad(ob_batch, ac_batch, ob_expert, ac_expert)
+            
+            # Modify gradient if too confident on first T timesteps.
+            if (batch_acc_ltt + expert_acc_ltt) / 2. >= 0.5:
+                delta_g = batch_g_ltt + expert_g_ltt
+                if (batch_acc_ltt + expert_acc_ltt) / 2. == 0.5:
+                    # This might happen if one goes to 1. and the other to 0.
+                    delta_g = delta_g / 2.
+                    g = g - delta_g
+
+            d_adam.update(allmean(g), d_stepsize)
+            d_losses.append(newlosses)
+            
             d_adam.update(allmean(g), d_stepsize)
             d_losses.append(newlosses)
         logger.log(fmt_row(13, np.mean(d_losses, axis=0)))
