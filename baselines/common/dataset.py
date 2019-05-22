@@ -47,7 +47,13 @@ class Dataset(object):
         return Dataset(data_map, deterministic)
 
 
-def iterbatches(arrays, *, num_batches=None, batch_size=None, shuffle=True, include_final_partial_batch=True):
+def iterbatches(arrays,
+                *,
+                num_batches=None,
+                batch_size=None,
+                shuffle=True,
+                include_final_partial_batch=True,
+                yield_t=False):
     assert (num_batches is None) != (batch_size is None), 'Provide num_batches or batch_size, but not both'
     arrays = tuple(map(np.asarray, arrays))
     n = arrays[0].shape[0]
@@ -57,4 +63,7 @@ def iterbatches(arrays, *, num_batches=None, batch_size=None, shuffle=True, incl
     sections = np.arange(0, n, batch_size)[1:] if num_batches is None else num_batches
     for batch_inds in np.array_split(inds, sections):
         if include_final_partial_batch or len(batch_inds) == batch_size:
-            yield tuple(a[batch_inds] for a in arrays)
+            if not yield_t:
+                yield tuple(a[batch_inds] for a in arrays)
+            else:
+                yield batch_inds, tuple(a[batch_inds] for a in arrays)
