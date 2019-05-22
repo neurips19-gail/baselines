@@ -8,6 +8,8 @@ import numpy as np
 from baselines.common.mpi_running_mean_std import RunningMeanStd
 from baselines.common import tf_util as U
 
+NOISE_DIM = 10
+
 def logsigmoid(a):
     '''Equivalent to tf.log(tf.sigmoid(a))'''
     return -tf.nn.softplus(-a)
@@ -20,7 +22,8 @@ def logit_bernoulli_entropy(logits):
 class TransitionClassifier(object):
     def __init__(self, env, hidden_size, entcoeff=0.001, lr_rate=1e-3, scope="adversary"):
         self.scope = scope
-        self.observation_shape = env.observation_space.shape
+        self.observation_shape = tuple(
+            [s + NOISE_DIM for s in env.observation_space.shape])
         self.actions_shape = env.action_space.shape
         self.input_shape = tuple([o+a for o, a in zip(self.observation_shape, self.actions_shape)])
         self.num_actions = env.action_space.shape[0]
@@ -52,6 +55,18 @@ class TransitionClassifier(object):
         var_list = self.get_trainable_variables()
         self.lossandgrad = U.function([self.generator_obs_ph, self.generator_acs_ph, self.expert_obs_ph, self.expert_acs_ph],
                                       self.losses + [U.flatgrad(self.total_loss, var_list)])
+        
+        # Expose agent accuracy and gradient w.r.t. agent loss.
+        self.batchaccandgrad = U.function([
+            self.generator_obs_ph, self.generator_acs_ph, self.expert_obs_ph,
+            self.expert_acs_ph
+        ], [generator_acc] + [U.flatgrad(generator_loss, var_list)])
+
+        # Expose expert accuracy and gradient w.r.t. expert loss.
+        self.expertaccandgrad = U.function([
+            self.generator_obs_ph, self.generator_acs_ph, self.expert_obs_ph,
+            self.expert_acs_ph
+        ], [expert_acc] + [U.flatgrad(expert_loss, var_list)])
 
     def build_ph(self):
         self.generator_obs_ph = tf.placeholder(tf.float32, (None, ) + self.observation_shape, name="observations_ph")
